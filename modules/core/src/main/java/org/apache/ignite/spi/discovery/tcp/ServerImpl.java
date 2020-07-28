@@ -189,6 +189,12 @@ class ServerImpl extends TcpDiscoveryImpl {
     /** When this interval pass connection check will be performed. */
     private static final int CON_CHECK_INTERVAL = 500;
 
+    /** Maximal interval of connection check to next node in the ring. */
+    private static final long MAX_CON_CHECK_INTERVAL = 500;
+
+    /** Interval of checking connection to next node in the ring. */
+    private long connCheckInterval;
+
     /** */
     private IgniteThreadPoolExecutor utilityPool;
 
@@ -259,6 +265,9 @@ class ServerImpl extends TcpDiscoveryImpl {
     /** Last time received message from ring. */
     private volatile long lastRingMsgReceivedTime;
 
+    /** Time of last sent and acknowledged message. */
+    private volatile long lastRingMsgSentTime;
+
     /** Map with proceeding ping requests. */
     private final ConcurrentMap<InetSocketAddress, GridPingFutureAdapter<IgniteBiTuple<UUID, Boolean>>> pingMap =
         new ConcurrentHashMap<>();
@@ -322,7 +331,7 @@ class ServerImpl extends TcpDiscoveryImpl {
 
     /** {@inheritDoc} */
     @Override public long connectionCheckInterval() {
-        return CON_CHECK_INTERVAL;
+        return connCheckInterval;
     }
 
     /** {@inheritDoc} */
@@ -332,6 +341,15 @@ class ServerImpl extends TcpDiscoveryImpl {
         }
 
         lastRingMsgReceivedTime = 0;
+
+        lastRingMsgSentTime = 0;
+
+        long msgExchangeTimeout = spi.failureDetectionTimeoutEnabled() ? spi.failureDetectionTimeout() :
+                spi.getSocketTimeout() + spi.getAckTimeout();
+
+        // Since we take in account time of last sent message, the interval should be quite short to give enough piece
+        // of failure detection timeout as send-and-acknowledge timeout of the message to send.
+        connCheckInterval = Math.min(msgExchangeTimeout / 4, MAX_CON_CHECK_INTERVAL);
 
         utilityPool = new IgniteThreadPoolExecutor("disco-pool",
             spi.ignite().name(),
@@ -2655,7 +2673,6 @@ class ServerImpl extends TcpDiscoveryImpl {
         private RingMessageWorker(IgniteLogger log) {
             super("tcp-disco-msg-worker", log, 10, getWorkerRegistry(spi));
 
-            initConnectionCheckThreshold();
 
             setBeforeEachPollAction(() -> {
                 updateHeartbeat();
@@ -2750,18 +2767,7 @@ class ServerImpl extends TcpDiscoveryImpl {
             }
         }
 
-        /**
-         * Initializes connection check frequency. Used only when failure detection timeout is enabled.
-         */
-        private void initConnectionCheckThreshold() {
-            if (spi.failureDetectionTimeoutEnabled())
-                connCheckThreshold = spi.failureDetectionTimeout();
-            else
-                connCheckThreshold = Math.min(spi.getSocketTimeout(), spi.metricsUpdateFreq);
 
-            if (log.isInfoEnabled())
-                log.info("Connection check threshold is calculated: " + connCheckThreshold);
-        }
 
         /**
          * @param msg Message to process.
@@ -2849,8 +2855,6 @@ class ServerImpl extends TcpDiscoveryImpl {
                 // Received a message from remote node.
                 onMessageExchanged();
 
-                // Reset the failure flag.
-                failureThresholdReached = false;
             }
 
             spi.stats.onMessageProcessingFinished(msg);
@@ -3140,6 +3144,7 @@ class ServerImpl extends TcpDiscoveryImpl {
                                             break;
                                         }
                                     }
+                                    updateLastSentMessageTime();
 
                                     if (log.isDebugEnabled())
                                         log.debug("Initialized connection with next node: " + next.id());
@@ -3228,7 +3233,8 @@ class ServerImpl extends TcpDiscoveryImpl {
                                         pendingMsgs.discardId, pendingMsgs.customDiscardId);
 
                                     if (timeoutHelper == null)
-                                        timeoutHelper = new IgniteSpiOperationTimeoutHelper(spi, true);
+                                        timeoutHelper = new IgniteSpiOperationTimeoutHelper(spi, true,
+                                                lastRingMsgSentTime);
 
                                     try {
                                         spi.writeToSocket(sock, out, pendingMsg, timeoutHelper.nextTimeoutChunk(
@@ -3241,6 +3247,8 @@ class ServerImpl extends TcpDiscoveryImpl {
                                     long tstamp0 = U.currentTimeMillis();
 
                                     int res = spi.readReceipt(sock, timeoutHelper.nextTimeoutChunk(ackTimeout0));
+
+                                    updateLastSentMessageTime();
 
                                     spi.stats.onMessageSent(pendingMsg, tstamp0 - tstamp);
 
@@ -3270,7 +3278,8 @@ class ServerImpl extends TcpDiscoveryImpl {
                                 long tstamp = U.currentTimeMillis();
 
                                 if (timeoutHelper == null)
-                                    timeoutHelper = new IgniteSpiOperationTimeoutHelper(spi, true);
+                                    timeoutHelper = new IgniteSpiOperationTimeoutHelper(spi, true,
+                                            lastRingMsgSentTime);
 
                                 if (!failedNodes.isEmpty()) {
                                     for (TcpDiscoveryNode failedNode : failedNodes) {
@@ -5739,6 +5748,12 @@ class ServerImpl extends TcpDiscoveryImpl {
         @Override public String toString() {
             return String.format("%s, nextNode=[%s]", super.toString(), next);
         }
+    }
+
+
+    /** Fixates time of last sent message. */
+    private void updateLastSentMessageTime() {
+        lastRingMsgSentTime = System.nanoTime();
     }
 
     /** Thread that executes {@link TcpServer}'s code. */

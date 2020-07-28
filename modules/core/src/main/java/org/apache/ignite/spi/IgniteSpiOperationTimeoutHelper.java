@@ -27,10 +27,14 @@ import org.apache.ignite.internal.util.typedef.internal.U;
  *
  * A new instance of the class should be created for every complex network based operations that usually consists of
  * request and response parts.
+ *
  */
 public class IgniteSpiOperationTimeoutHelper {
+    // https://issues.apache.org/jira/browse/IGNITE-11221
+    // We need to reuse new logic ExponentialBackoffTimeout logic in TcpDiscovery instead of this class.
+
     /** */
-    private long lastOperStartTs;
+    private long lastOperStartNanos;
 
     /** */
     private long timeout;
@@ -54,6 +58,22 @@ public class IgniteSpiOperationTimeoutHelper {
     }
 
     /**
+     * Creates timeout helper based on time of last related operation.
+     *
+     * @param adapter SPI adapter.
+     * @param srvOp {@code True} if communicates with server node.
+     * @param lastOperStartNanos Time of last related operation in nanos.
+     */
+    public IgniteSpiOperationTimeoutHelper(IgniteSpiAdapter adapter, boolean srvOp, long lastOperStartNanos) {
+        this(adapter, srvOp);
+
+        this.lastOperStartNanos = lastOperStartNanos;
+
+        if (lastOperStartNanos > 0)
+            timeout = failureDetectionTimeout;
+    }
+
+    /**
      * Returns a timeout value to use for the next network operation.
      *
      * If failure detection timeout is enabled then the returned value is a portion of time left since the last time
@@ -68,16 +88,16 @@ public class IgniteSpiOperationTimeoutHelper {
         if (!failureDetectionTimeoutEnabled)
             return dfltTimeout;
 
-        if (lastOperStartTs == 0) {
+        if (lastOperStartNanos == 0) {
             timeout = failureDetectionTimeout;
-            lastOperStartTs = U.currentTimeMillis();
+            lastOperStartNanos = System.nanoTime();
         }
         else {
-            long curTs = U.currentTimeMillis();
+            long curNanos = System.nanoTime();
 
-            timeout = timeout - (curTs - lastOperStartTs);
+            timeout -= U.nanosToMillis(curNanos - lastOperStartNanos);
 
-            lastOperStartTs = curTs;
+            lastOperStartNanos = curNanos;
 
             if (timeout <= 0)
                 throw new IgniteSpiOperationTimeoutException("Network operation timed out. Increase " +
@@ -101,6 +121,6 @@ public class IgniteSpiOperationTimeoutHelper {
         if (X.hasCause(e, IgniteSpiOperationTimeoutException.class, SocketTimeoutException.class, SocketException.class))
             return true;
 
-        return (timeout - (U.currentTimeMillis() - lastOperStartTs) <= 0);
+        return (timeout - U.millisSinceNanos(lastOperStartNanos) <= 0);
     }
 }
